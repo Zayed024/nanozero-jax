@@ -1,0 +1,12 @@
+# Day 1 (model + logit-match gate)
+jax                      # on Colab GPU use the preinstalled jax; CPU is fine for the gate
+numpy
+safetensors
+huggingface_hub
+transformers
+torch                    # reference logits only (not used in training)
+
+datasets                 # Day 3: Jiayi-Pan/Countdown-Tasks-3to4
+
+# Later days (uncomment as you reach them)
+# optax                  # Day 4: GRPO optimizer

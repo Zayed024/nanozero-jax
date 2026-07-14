@@ -1,0 +1,128 @@
+"""NanoZero training: GRPO on Countdown, LoRA on a small model, single 16 GB card.
+
+`grpo_update` is the trainable core (pure JAX + optax, CPU-testable on a tiny model).
+`train` is the Colab orchestration that wires the real model + tokenizer + Countdown data:
+
+    run each prompt G times -> reward each completion -> group-relative advantage ->
+    GRPO loss vs the LoRA-off reference -> optax step on LoRA.
+
+Usage (Colab, one 16 GB GPU):
+    python train.py            # trains Qwen2.5-0.5B LoRA on Countdown
+"""
+
+from __future__ import annotations
+
+import optax
+
+import nanozero as nz
+from countdown import build_user_prompt, load_countdown, reward
+
+
+# --------------------------------------------------------------------------------------
+# trainable core (pure JAX + optax; no tokenizer/model download needed to test)
+# --------------------------------------------------------------------------------------
+def grpo_update(params, lora, opt_state, optimizer, batch, cfg, *, group_size, clip_eps=0.2, kl_beta=0.001, lora_scale=1.0):
+    """One GRPO optimizer step on the LoRA params. `batch` is the rollout output:
+    (full_ids, full_mask, resp_mask, old_lp, rewards). Returns (lora, opt_state, metrics)."""
+    import jax
+
+    full_ids, full_mask, resp_mask, old_lp, rewards = batch
+    adv = nz.group_advantages(rewards, group_size)
+    ref_lp = jax.lax.stop_gradient(nz.sequence_logprobs(params, full_ids, cfg, full_mask))  # frozen base
+
+    def loss_fn(lora):
+        pol_lp = nz.sequence_logprobs(params, full_ids, cfg, full_mask, lora=lora, lora_scale=lora_scale)
+        return nz.grpo_loss(pol_lp, ref_lp, old_lp, adv, resp_mask, clip_eps=clip_eps, kl_beta=kl_beta)
+
+    loss, grads = jax.value_and_grad(loss_fn)(lora)
+    updates, opt_state = optimizer.update(grads, opt_state, lora)
+    lora = optax.apply_updates(lora, updates)
+    metrics = {
+        "loss": float(loss),
+        "reward_mean": float(rewards.mean()),
+        "reward_solved": float((rewards >= 1.0).mean()),
+        "adv_std": float(adv.std()),
+    }
+    return lora, opt_state, metrics
+
+
+# --------------------------------------------------------------------------------------
+# Colab orchestration (needs the real model + tokenizer)
+# --------------------------------------------------------------------------------------
+def _pass_at_1(completions, instances):
+    """Fraction of completions that solve their countdown instance (reward == 1.0). Pure."""
+    from countdown import compute_score
+
+    solved = [compute_score(c, {"target": x["target"], "numbers": x["numbers"]}) >= 1.0 for c, x in zip(completions, instances)]
+    return sum(solved) / max(len(solved), 1)
+
+
+def evaluate_countdown(params, cfg, tok, instances, *, pad_id, eos_id, max_new=256, lora=None):
+    """Greedy pass@1 on held-out countdown instances. lora=None -> baseline; lora set -> trained."""
+    import jax
+
+    prompt_ids, prompt_mask = _encode_prompts(tok, [build_user_prompt(x["numbers"], x["target"]) for x in instances], pad_id)
+    full_ids, _, _, _ = nz.generate(params, prompt_ids, prompt_mask, cfg, max_new=max_new, key=jax.random.PRNGKey(0), eos_id=eos_id, pad_id=pad_id, temperature=0.0, lora=lora)
+    completions = tok.batch_decode(full_ids[:, prompt_ids.shape[1]:], skip_special_tokens=True)
+    return _pass_at_1(completions, instances)
+
+
+def _encode_prompts(tok, user_prompts, pad_id):
+    """Chat-template each user prompt and LEFT-pad the batch. -> (ids [B,L], mask [B,L])."""
+    import jax.numpy as jnp
+
+    seqs = [tok.apply_chat_template([{"role": "user", "content": p}], add_generation_prompt=True, tokenize=True) for p in user_prompts]
+    L = max(len(s) for s in seqs)
+    ids = [[pad_id] * (L - len(s)) + list(s) for s in seqs]
+    mask = [[0] * (L - len(s)) + [1] * len(s) for s in seqs]
+    return jnp.asarray(ids, jnp.int32), jnp.asarray(mask, jnp.int32)
+
+
+def train(*, steps=100, n_prompts=8, group_size=8, max_new=256, rank=16, lr=1e-4, kl_beta=0.001, temperature=1.0, seed=0, pool_size=2000):
+    import jax
+    import jax.numpy as jnp
+    from transformers import AutoTokenizer
+
+    params, cfg, path = nz.load_params()
+    tok = AutoTokenizer.from_pretrained(path)
+    eos_id, pad_id = tok.eos_token_id, (tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id)
+
+    lora = nz.init_lora(params, cfg, rank=rank, seed=seed)
+    optimizer = optax.chain(optax.clip_by_global_norm(1.0), optax.adamw(lr))
+    opt_state = optimizer.init(lora)
+
+    pool = load_countdown(pool_size)
+    held_out = load_countdown(64, split="train")[-64:]  # small eval set (test split unlabeled)
+    key = jax.random.PRNGKey(seed)
+
+    base_acc = evaluate_countdown(params, cfg, tok, held_out, pad_id=pad_id, eos_id=eos_id, max_new=max_new, lora=None)
+    print(f"[eval] baseline (LoRA-off) pass@1 = {base_acc:.2%}")
+
+    for step in range(steps):
+        key, pk, gk = jax.random.split(key, 3)
+        idx = jax.random.randint(pk, (n_prompts,), 0, len(pool))
+        chosen = [pool[int(i)] for i in idx]
+        rep = [c for c in chosen for _ in range(group_size)]  # G rollouts per prompt
+
+        prompt_ids, prompt_mask = _encode_prompts(tok, [build_user_prompt(c["numbers"], c["target"]) for c in rep], pad_id)
+        full_ids, full_mask, resp_mask, old_lp = nz.generate(
+            params, prompt_ids, prompt_mask, cfg, max_new=max_new, key=gk, eos_id=eos_id, pad_id=pad_id, temperature=temperature, lora=lora
+        )
+
+        L = prompt_ids.shape[1]
+        completions = tok.batch_decode(full_ids[:, L:], skip_special_tokens=True)
+        rewards = jnp.asarray([reward(c, r["numbers"], r["target"]) for c, r in zip(completions, rep)], jnp.float32)
+
+        batch = (full_ids, full_mask, resp_mask, old_lp, rewards)
+        lora, opt_state, m = grpo_update(params, lora, opt_state, optimizer, batch, cfg, group_size=group_size, kl_beta=kl_beta)
+        print(f"step {step:3d} | loss {m['loss']:+.4f} | reward {m['reward_mean']:.3f} | solved {m['reward_solved']:.2%} | adv_std {m['adv_std']:.3f}")
+
+    final_acc = evaluate_countdown(params, cfg, tok, held_out, pad_id=pad_id, eos_id=eos_id, max_new=max_new, lora=lora)
+    print(f"[eval] baseline {base_acc:.2%} -> trained (LoRA-on) {final_acc:.2%}  (Δ {final_acc - base_acc:+.2%})")
+    nz.save_lora(lora, "nanozero_countdown_lora.npz")
+    print("[save] adapter -> nanozero_countdown_lora.npz")
+    return lora
+
+
+if __name__ == "__main__":
+    train()
