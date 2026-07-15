@@ -67,8 +67,16 @@ def evaluate_countdown(params, cfg, tok, instances, *, pad_id, eos_id, max_new=2
         chunk = instances[s : s + eval_batch]
         prompt_ids, prompt_mask = _encode_prompts(tok, [build_user_prompt(x["numbers"], x["target"]) for x in chunk], pad_id)
         full_ids, _, _, _ = nz.generate(params, prompt_ids, prompt_mask, cfg, max_new=max_new, key=jax.random.PRNGKey(0), eos_id=eos_id, pad_id=pad_id, temperature=0.0, lora=lora)
-        completions += tok.batch_decode(full_ids[:, prompt_ids.shape[1]:], skip_special_tokens=True)
+        completions += _decode(tok, full_ids[:, prompt_ids.shape[1]:])
     return _pass_at_1(completions, instances)
+
+
+def _decode(tok, ids_2d):
+    """batch_decode a JAX/numpy [B, T] id array: the fast (Rust) tokenizer only accepts
+    plain Python ints, not jax arrays."""
+    import numpy as np
+
+    return tok.batch_decode(np.asarray(ids_2d).tolist(), skip_special_tokens=True)
 
 
 def _chat_ids(tok, user_prompt):
@@ -125,7 +133,7 @@ def train(*, steps=100, n_prompts=8, group_size=8, max_new=256, rank=16, lr=1e-4
         )
 
         L = prompt_ids.shape[1]
-        completions = tok.batch_decode(full_ids[:, L:], skip_special_tokens=True)
+        completions = _decode(tok, full_ids[:, L:])
         rewards = jnp.asarray([reward(c, r["numbers"], r["target"]) for c, r in zip(completions, rep)], jnp.float32)
 
         batch = (full_ids, full_mask, resp_mask, old_lp, rewards)
