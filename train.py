@@ -67,11 +67,22 @@ def evaluate_countdown(params, cfg, tok, instances, *, pad_id, eos_id, max_new=2
     return _pass_at_1(completions, instances)
 
 
+def _chat_ids(tok, user_prompt):
+    """Chat-template one user prompt -> list[int], across transformers versions
+    (which variously return list[int], dict/BatchEncoding, or a batched list)."""
+    out = tok.apply_chat_template([{"role": "user", "content": user_prompt}], add_generation_prompt=True, tokenize=True)
+    if hasattr(out, "keys"):
+        out = out["input_ids"]
+    if out and isinstance(out[0], (list, tuple)):
+        out = out[0]
+    return list(out)
+
+
 def _encode_prompts(tok, user_prompts, pad_id):
     """Chat-template each user prompt and LEFT-pad the batch. -> (ids [B,L], mask [B,L])."""
     import jax.numpy as jnp
 
-    seqs = [tok.apply_chat_template([{"role": "user", "content": p}], add_generation_prompt=True, tokenize=True) for p in user_prompts]
+    seqs = [_chat_ids(tok, p) for p in user_prompts]
     L = max(len(s) for s in seqs)
     ids = [[pad_id] * (L - len(s)) + list(s) for s in seqs]
     mask = [[0] * (L - len(s)) + [1] * len(s) for s in seqs]
