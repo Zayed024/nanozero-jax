@@ -57,13 +57,17 @@ def _pass_at_1(completions, instances):
     return sum(solved) / max(len(solved), 1)
 
 
-def evaluate_countdown(params, cfg, tok, instances, *, pad_id, eos_id, max_new=256, lora=None):
-    """Greedy pass@1 on held-out countdown instances. lora=None -> baseline; lora set -> trained."""
+def evaluate_countdown(params, cfg, tok, instances, *, pad_id, eos_id, max_new=256, lora=None, eval_batch=16):
+    """Greedy pass@1 on held-out countdown instances. lora=None -> baseline; lora set -> trained.
+    Processed in mini-batches of `eval_batch` to keep T4 memory in check."""
     import jax
 
-    prompt_ids, prompt_mask = _encode_prompts(tok, [build_user_prompt(x["numbers"], x["target"]) for x in instances], pad_id)
-    full_ids, _, _, _ = nz.generate(params, prompt_ids, prompt_mask, cfg, max_new=max_new, key=jax.random.PRNGKey(0), eos_id=eos_id, pad_id=pad_id, temperature=0.0, lora=lora)
-    completions = tok.batch_decode(full_ids[:, prompt_ids.shape[1]:], skip_special_tokens=True)
+    completions = []
+    for s in range(0, len(instances), eval_batch):
+        chunk = instances[s : s + eval_batch]
+        prompt_ids, prompt_mask = _encode_prompts(tok, [build_user_prompt(x["numbers"], x["target"]) for x in chunk], pad_id)
+        full_ids, _, _, _ = nz.generate(params, prompt_ids, prompt_mask, cfg, max_new=max_new, key=jax.random.PRNGKey(0), eos_id=eos_id, pad_id=pad_id, temperature=0.0, lora=lora)
+        completions += tok.batch_decode(full_ids[:, prompt_ids.shape[1]:], skip_special_tokens=True)
     return _pass_at_1(completions, instances)
 
 

@@ -142,8 +142,8 @@ def mlp(x, p):
     return (jax.nn.silu(x @ p["w_gate"]) * (x @ p["w_up"])) @ p["w_down"]
 
 
-def forward(params, ids, cfg: Config, attn_mask=None, position_ids=None, lora=None, lora_scale=1.0):
-    """ids: [B, T] int32 -> logits [B, T, vocab].
+def backbone(params, ids, cfg: Config, attn_mask=None, position_ids=None, lora=None, lora_scale=1.0):
+    """ids: [B, T] int32 -> final hidden states [B, T, hidden] (pre-LM-head).
 
     attn_mask:    [B, T] 1 for real tokens, 0 for padding (default: all real).
     position_ids: [B, T] (default: arange, i.e. no left-padding).
@@ -168,9 +168,18 @@ def forward(params, ids, cfg: Config, attn_mask=None, position_ids=None, lora=No
         ll = lora_layers[i] if lora_layers else None
         x = x + attention(rmsnorm(x, p["ln1"], cfg.eps), p, cos, sin, cfg, bias, ll, lora_scale)
         x = x + mlp(rmsnorm(x, p["ln2"], cfg.eps), p)
-    x = rmsnorm(x, params["norm"], cfg.eps)
-    lm_head = params["embed"].T if cfg.tie_embeddings else params["lm_head"]
-    return x @ lm_head
+    return rmsnorm(x, params["norm"], cfg.eps)
+
+
+def _lm_head(params, cfg: Config):
+    return params["embed"].T if cfg.tie_embeddings else params["lm_head"]
+
+
+def forward(params, ids, cfg: Config, attn_mask=None, position_ids=None, lora=None, lora_scale=1.0):
+    """Full logits [B, T, vocab]. NB: materializes B*T*vocab floats — fine for short
+    sequences/small batches (the logit gate), but use `generate`/`sequence_logprobs`
+    for training-sized batches (they avoid the full logits tensor)."""
+    return backbone(params, ids, cfg, attn_mask, position_ids, lora, lora_scale) @ _lm_head(params, cfg)
 
 
 # --------------------------------------------------------------------------------------
@@ -231,14 +240,29 @@ def _positions(attn_mask):
     return jnp.clip(pos, 0, None).astype(jnp.int32)
 
 
-def sequence_logprobs(params, ids, cfg: Config, attn_mask, lora=None, lora_scale=1.0):
+def sequence_logprobs(params, ids, cfg: Config, attn_mask, lora=None, lora_scale=1.0, chunk: int = 64):
     """Per-token logprobs under `params` (+ optional LoRA), position-aligned.
     This is the GRPO policy pass (lora set) and reference pass (lora=None).
-    ids/attn_mask: [B, T] -> [B, T]."""
-    logits = forward(params, ids, cfg, attn_mask, _positions(attn_mask), lora, lora_scale)
-    logp = jax.nn.log_softmax(logits[:, :-1].astype(jnp.float32), axis=-1)  # [B, T-1, V]
-    tok = ids[:, 1:]
-    lp = jnp.take_along_axis(logp, tok[..., None], axis=-1)[..., 0]  # [B, T-1]
+    ids/attn_mask: [B, T] -> [B, T].
+
+    The LM head is applied in `chunk`-sized slices over T (with rematerialization),
+    so the full [B, T, vocab] logits tensor never exists — at vocab 152k that tensor
+    is what OOMs a 16 GB card, not the model itself.
+    """
+    h = backbone(params, ids, cfg, attn_mask, _positions(attn_mask), lora, lora_scale)  # [B, T, H]
+    head = _lm_head(params, cfg)
+    B, T, _ = h.shape
+    h_shift = h[:, :-1]  # [B, T-1, H]: hidden at p predicts the token at p+1
+    tok = ids[:, 1:]  # [B, T-1]
+
+    @jax.checkpoint
+    def _chunk_lp(h_slice, tok_slice):
+        logits = (h_slice @ head).astype(jnp.float32)  # [B, c, V] — only one chunk alive at a time
+        logp = jax.nn.log_softmax(logits, axis=-1)
+        return jnp.take_along_axis(logp, tok_slice[..., None], axis=-1)[..., 0]  # [B, c]
+
+    parts = [_chunk_lp(h_shift[:, s : s + chunk], tok[:, s : s + chunk]) for s in range(0, T - 1, chunk)]
+    lp = jnp.concatenate(parts, axis=1)  # [B, T-1]
     return jnp.pad(lp, ((0, 0), (1, 0)))  # [B, T]; shift so index == token position
 
 
@@ -262,10 +286,18 @@ def generate(params, prompt_ids, prompt_mask, cfg: Config, *, max_new, key, eos_
     keys = jax.random.split(key, max_new)
     arangeB = jnp.arange(B)
 
-    fwd = jax.jit(lambda pr, i, m: forward(pr, i, cfg, m, _positions(m), lora, lora_scale))  # constant shape -> one compile
+    # Per-step logits ONLY at the current position: [B, V] instead of the full
+    # [B, T, V] tensor (which at vocab 152k is gigabytes and OOMs the T4 autotuner).
+    # `cur` is passed as a traced index so this compiles exactly once.
+    def _step(pr, i, m, c):
+        h = backbone(pr, i, cfg, m, _positions(m), lora, lora_scale)  # [B, T, H]
+        h_cur = jax.lax.dynamic_index_in_dim(h, c, axis=1, keepdims=False)  # [B, H]
+        return h_cur @ _lm_head(pr, cfg)  # [B, V]
+
+    step_fn = jax.jit(_step)
     for s in range(max_new):
-        cur = L + s  # static python int
-        raw = fwd(params, ids, mask)[:, cur - 1].astype(jnp.float32)  # logits for the next token, [B, V]
+        cur = L + s
+        raw = step_fn(params, ids, mask, jnp.int32(cur - 1)).astype(jnp.float32)  # [B, V]
         if temperature > 0:
             logits = raw / temperature
             nxt = jax.random.categorical(keys[s], logits, axis=-1)
