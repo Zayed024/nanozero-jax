@@ -367,7 +367,10 @@ def _logit_match_gate(repo: str = REPO, tol: float = 1e-2):
 
     tok = AutoTokenizer.from_pretrained(path)
     msgs = [{"role": "user", "content": "Using the numbers [3, 7, 11], make 28."}]
-    ids = tok.apply_chat_template(msgs, add_generation_prompt=True, return_tensors="np").astype(np.int32)
+    # tokenize=True returns a plain list[int] on every transformers version
+    # (return_tensors="np" returns a BatchEncoding on newer versions and breaks .astype)
+    token_list = tok.apply_chat_template(msgs, add_generation_prompt=True, tokenize=True)
+    ids = np.asarray([token_list], dtype=np.int32)
     print(f"  prompt tokens: {ids.shape}")
 
     logits = np.asarray(forward(params, jnp.asarray(ids), cfg))  # [1, T, vocab]
