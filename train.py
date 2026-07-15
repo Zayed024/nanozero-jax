@@ -31,7 +31,9 @@ def grpo_update(params, lora, opt_state, optimizer, batch, cfg, *, group_size, c
     ref_lp = jax.lax.stop_gradient(nz.sequence_logprobs(params, full_ids, cfg, full_mask))  # frozen base
 
     def loss_fn(lora):
-        pol_lp = nz.sequence_logprobs(params, full_ids, cfg, full_mask, lora=lora, lora_scale=lora_scale)
+        # remat=True: this is the differentiated pass — without per-layer checkpointing
+        # the backward residuals (24 x [B,nh,T,T]) OOM a 16 GB card.
+        pol_lp = nz.sequence_logprobs(params, full_ids, cfg, full_mask, lora=lora, lora_scale=lora_scale, remat=True)
         return nz.grpo_loss(pol_lp, ref_lp, old_lp, adv, resp_mask, clip_eps=clip_eps, kl_beta=kl_beta)
 
     loss, grads = jax.value_and_grad(loss_fn)(lora)
@@ -101,7 +103,7 @@ def _encode_prompts(tok, user_prompts, pad_id):
     return jnp.asarray(ids, jnp.int32), jnp.asarray(mask, jnp.int32)
 
 
-def train(*, steps=100, n_prompts=8, group_size=8, max_new=256, rank=16, lr=1e-4, kl_beta=0.001, temperature=1.0, seed=0, pool_size=2000):
+def train(*, steps=100, n_prompts=8, group_size=8, max_new=256, rank=16, lr=1e-4, kl_beta=0.001, temperature=1.0, seed=0, pool_size=2000, eval_n=32):
     import jax
     import jax.numpy as jnp
     from transformers import AutoTokenizer
@@ -115,7 +117,7 @@ def train(*, steps=100, n_prompts=8, group_size=8, max_new=256, rank=16, lr=1e-4
     opt_state = optimizer.init(lora)
 
     pool = load_countdown(pool_size)
-    held_out = load_countdown(64, split="train")[-64:]  # small eval set (test split unlabeled)
+    held_out = load_countdown(pool_size + eval_n, split="train")[-eval_n:]  # held out AFTER the training pool
     key = jax.random.PRNGKey(seed)
 
     base_acc = evaluate_countdown(params, cfg, tok, held_out, pad_id=pad_id, eos_id=eos_id, max_new=max_new, lora=None)

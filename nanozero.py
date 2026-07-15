@@ -142,13 +142,17 @@ def mlp(x, p):
     return (jax.nn.silu(x @ p["w_gate"]) * (x @ p["w_up"])) @ p["w_down"]
 
 
-def backbone(params, ids, cfg: Config, attn_mask=None, position_ids=None, lora=None, lora_scale=1.0):
+def backbone(params, ids, cfg: Config, attn_mask=None, position_ids=None, lora=None, lora_scale=1.0, remat=False):
     """ids: [B, T] int32 -> final hidden states [B, T, hidden] (pre-LM-head).
 
     attn_mask:    [B, T] 1 for real tokens, 0 for padding (default: all real).
     position_ids: [B, T] (default: arange, i.e. no left-padding).
     lora:         optional LoRA pytree (see `init_lora`). None -> frozen base pass
                   (this IS the GRPO reference pass — no separate model copy needed).
+    remat:        gradient-checkpoint each layer. REQUIRED when differentiating at
+                  training batch sizes: without it, backward stores every layer's
+                  attention residuals ([B,nh,T,T] x 24 layers ~ 16 GB) and OOMs a T4.
+                  Forward-only callers (generate/eval) leave it off.
     """
     B, T = ids.shape
     if position_ids is None:
@@ -162,12 +166,16 @@ def backbone(params, ids, cfg: Config, attn_mask=None, position_ids=None, lora=N
         key_ok = attn_mask[:, None, None, :].astype(bool)  # [B, 1, 1, T]
         bias = jnp.where(key_ok, bias, -1e30)
 
+    def _layer(x, p, ll):
+        x = x + attention(rmsnorm(x, p["ln1"], cfg.eps), p, cos, sin, cfg, bias, ll, lora_scale)
+        return x + mlp(rmsnorm(x, p["ln2"], cfg.eps), p)
+
+    layer_fn = jax.checkpoint(_layer) if remat else _layer
+
     lora_layers = lora["layers"] if lora else None
     x = params["embed"][ids]  # [B, T, hidden]
     for i, p in enumerate(params["layers"]):
-        ll = lora_layers[i] if lora_layers else None
-        x = x + attention(rmsnorm(x, p["ln1"], cfg.eps), p, cos, sin, cfg, bias, ll, lora_scale)
-        x = x + mlp(rmsnorm(x, p["ln2"], cfg.eps), p)
+        x = layer_fn(x, p, lora_layers[i] if lora_layers else None)
     return rmsnorm(x, params["norm"], cfg.eps)
 
 
@@ -240,7 +248,7 @@ def _positions(attn_mask):
     return jnp.clip(pos, 0, None).astype(jnp.int32)
 
 
-def sequence_logprobs(params, ids, cfg: Config, attn_mask, lora=None, lora_scale=1.0, chunk: int = 64):
+def sequence_logprobs(params, ids, cfg: Config, attn_mask, lora=None, lora_scale=1.0, chunk: int = 64, remat=False):
     """Per-token logprobs under `params` (+ optional LoRA), position-aligned.
     This is the GRPO policy pass (lora set) and reference pass (lora=None).
     ids/attn_mask: [B, T] -> [B, T].
@@ -249,7 +257,7 @@ def sequence_logprobs(params, ids, cfg: Config, attn_mask, lora=None, lora_scale
     so the full [B, T, vocab] logits tensor never exists — at vocab 152k that tensor
     is what OOMs a 16 GB card, not the model itself.
     """
-    h = backbone(params, ids, cfg, attn_mask, _positions(attn_mask), lora, lora_scale)  # [B, T, H]
+    h = backbone(params, ids, cfg, attn_mask, _positions(attn_mask), lora, lora_scale, remat=remat)  # [B, T, H]
     head = _lm_head(params, cfg)
     B, T, _ = h.shape
     h_shift = h[:, :-1]  # [B, T-1, H]: hidden at p predicts the token at p+1
