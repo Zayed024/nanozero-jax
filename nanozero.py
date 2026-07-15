@@ -109,14 +109,22 @@ def _lora_delta(x, lora_layer, key, scale):
     return ((x @ ab["A"]) @ ab["B"]) * scale
 
 
+def _attn_qkv(x, p, cfg: Config, lora_layer, lora_scale):
+    """Project x -> (q [B,T,nh,hd], k [B,T,nkv,hd], v [B,T,nkv,hd]), pre-RoPE."""
+    B, T, _ = x.shape
+    nh, nkv, hd = cfg.n_heads, cfg.n_kv_heads, cfg.head_dim
+    q = (x @ p["wq"] + p["bq"] + _lora_delta(x, lora_layer, "wq", lora_scale)).reshape(B, T, nh, hd)
+    k = (x @ p["wk"] + p["bk"] + _lora_delta(x, lora_layer, "wk", lora_scale)).reshape(B, T, nkv, hd)
+    v = (x @ p["wv"] + p["bv"] + _lora_delta(x, lora_layer, "wv", lora_scale)).reshape(B, T, nkv, hd)
+    return q, k, v
+
+
 def attention(x, p, cos, sin, cfg: Config, attn_bias, lora_layer=None, lora_scale=1.0):
     # attn_bias: [B, 1, T, T] additive (0 where allowed, -1e30 where masked)
     B, T, _ = x.shape
     nh, nkv, hd = cfg.n_heads, cfg.n_kv_heads, cfg.head_dim
 
-    q = (x @ p["wq"] + p["bq"] + _lora_delta(x, lora_layer, "wq", lora_scale)).reshape(B, T, nh, hd)
-    k = (x @ p["wk"] + p["bk"] + _lora_delta(x, lora_layer, "wk", lora_scale)).reshape(B, T, nkv, hd)
-    v = (x @ p["wv"] + p["bv"] + _lora_delta(x, lora_layer, "wv", lora_scale)).reshape(B, T, nkv, hd)
+    q, k, v = _attn_qkv(x, p, cfg, lora_layer, lora_scale)
 
     q = apply_rope(q, cos, sin)
     k = apply_rope(k, cos, sin)
@@ -274,16 +282,138 @@ def sequence_logprobs(params, ids, cfg: Config, attn_mask, lora=None, lora_scale
     return jnp.pad(lp, ((0, 0), (1, 0)))  # [B, T]; shift so index == token position
 
 
-def generate(params, prompt_ids, prompt_mask, cfg: Config, *, max_new, key, eos_id, pad_id, temperature=1.0, lora=None, lora_scale=1.0):
-    """Fixed-buffer batched sampling for left-padded prompts.
+# --------------------------------------------------------------------------------------
+# KV-cache decoding: prefill the prompt once, then each new token attends against the
+# cached K/V instead of recomputing the whole prefix — O(T) decode instead of O(T^2).
+# --------------------------------------------------------------------------------------
+def prefill(params, ids, mask, cfg: Config, *, cache_len: int, lora=None, lora_scale=1.0):
+    """Run the prompt through the backbone, caching post-RoPE K/V per layer in
+    zero-padded buffers of length `cache_len`. Returns (last_hidden [B,H], cache)."""
+    B, L = ids.shape
+    position_ids = _positions(mask)
+    cos, sin = rope_cos_sin(position_ids, cfg.head_dim, cfg.rope_theta)
+    causal = jnp.tril(jnp.ones((L, L), dtype=bool))
+    bias = jnp.where(causal, 0.0, -1e30)[None, None]
+    bias = jnp.where(mask[:, None, None, :].astype(bool), bias, -1e30)
 
-    Compiles `forward` ONCE (shapes are constant across steps), then loops on the host.
-    No KV cache yet -> every step recomputes the full prefix; that redundant compute is
-    the Day-6 throughput target, not a correctness issue. Returns (all [B, L+max_new]):
+    nh, nkv, hd = cfg.n_heads, cfg.n_kv_heads, cfg.head_dim
+    lora_layers = lora["layers"] if lora else None
+    x = params["embed"][ids]
+    cache = []
+    for i, p in enumerate(params["layers"]):
+        ll = lora_layers[i] if lora_layers else None
+        h = rmsnorm(x, p["ln1"], cfg.eps)
+        q, k, v = _attn_qkv(h, p, cfg, ll, lora_scale)
+        q = apply_rope(q, cos, sin)
+        k = apply_rope(k, cos, sin)
+
+        # cache the roped K and V, padded out to the full generation buffer
+        k_buf = jnp.zeros((B, cache_len, nkv, hd), k.dtype).at[:, :L].set(k)
+        v_buf = jnp.zeros((B, cache_len, nkv, hd), v.dtype).at[:, :L].set(v)
+        cache.append({"k": k_buf, "v": v_buf})
+
+        kx = jnp.repeat(k, nh // nkv, axis=2).transpose(0, 2, 1, 3)
+        vx = jnp.repeat(v, nh // nkv, axis=2).transpose(0, 2, 1, 3)
+        qx = q.transpose(0, 2, 1, 3)
+        scores = (qx @ kx.transpose(0, 1, 3, 2)) / math.sqrt(hd)
+        attn = jax.nn.softmax(scores.astype(jnp.float32) + bias, axis=-1).astype(x.dtype)
+        out = (attn @ vx).transpose(0, 2, 1, 3).reshape(B, L, nh * hd)
+        x = x + (out @ p["wo"] + _lora_delta(out, ll, "wo", lora_scale))
+        x = x + mlp(rmsnorm(x, p["ln2"], cfg.eps), p)
+    x = rmsnorm(x, params["norm"], cfg.eps)
+    return x[:, -1], cache  # last position's hidden state -> first next-token logits
+
+
+def _decode_step(params, cache, tok, cur, pos_row, key_mask, cfg: Config, lora, lora_scale):
+    """One incremental decode step. tok [B] (the token just placed at buffer column
+    `cur`), pos_row [B] (its RoPE position per row), key_mask [B, cache_len] (1 for
+    every valid key including `cur`). Returns (next-token logits [B,V], updated cache)."""
+    nh, nkv, hd = cfg.n_heads, cfg.n_kv_heads, cfg.head_dim
+    B = tok.shape[0]
+    cos, sin = rope_cos_sin(pos_row[:, None], cfg.head_dim, cfg.rope_theta)  # [B,1,hd]
+    lora_layers = lora["layers"] if lora else None
+
+    x = params["embed"][tok][:, None, :]  # [B,1,H]
+    new_cache = []
+    for i, p in enumerate(params["layers"]):
+        ll = lora_layers[i] if lora_layers else None
+        h = rmsnorm(x, p["ln1"], cfg.eps)
+        q, k, v = _attn_qkv(h, p, cfg, ll, lora_scale)  # [B,1,...]
+        q = apply_rope(q, cos, sin)
+        k = apply_rope(k, cos, sin)
+
+        k_buf = jax.lax.dynamic_update_slice(cache[i]["k"], k, (0, cur, 0, 0))
+        v_buf = jax.lax.dynamic_update_slice(cache[i]["v"], v, (0, cur, 0, 0))
+        new_cache.append({"k": k_buf, "v": v_buf})
+
+        kx = jnp.repeat(k_buf, nh // nkv, axis=2)  # [B,C,nh,hd]
+        vx = jnp.repeat(v_buf, nh // nkv, axis=2)
+        # q [B,1,nh,hd] vs all cached keys: scores [B,nh,C]
+        scores = jnp.einsum("bxhd,bchd->bhc", q, kx) / math.sqrt(hd)
+        scores = jnp.where(key_mask[:, None, :].astype(bool), scores.astype(jnp.float32), -1e30)
+        attn = jax.nn.softmax(scores, axis=-1).astype(x.dtype)
+        out = jnp.einsum("bhc,bchd->bhd", attn, vx).reshape(B, 1, nh * hd)
+        x = x + (out @ p["wo"] + _lora_delta(out, ll, "wo", lora_scale))
+        x = x + mlp(rmsnorm(x, p["ln2"], cfg.eps), p)
+    x = rmsnorm(x, params["norm"], cfg.eps)[:, 0]  # [B,H]
+    return x @ _lm_head(params, cfg), new_cache
+
+
+def generate(params, prompt_ids, prompt_mask, cfg: Config, *, max_new, key, eos_id, pad_id, temperature=1.0, lora=None, lora_scale=1.0):
+    """KV-cached batched sampling for left-padded prompts: prefill once, then O(1)
+    work per generated token. Returns (all [B, L+max_new]):
         ids        full sequence (prompt + generation; pad after EOS)
         full_mask  1 on every real token (prompt + active generation)
         resp_mask  1 only on generated (response) token positions
         gen_logp   policy logprob of each generated token, position-aligned
+    """
+    B, L = prompt_ids.shape
+    Lmax = L + max_new
+    ids = jnp.concatenate([prompt_ids, jnp.full((B, max_new), pad_id, prompt_ids.dtype)], axis=1)
+    mask = jnp.concatenate([prompt_mask, jnp.zeros((B, max_new), prompt_mask.dtype)], axis=1)
+    gen_logp = jnp.zeros((B, Lmax), jnp.float32)
+    finished = jnp.zeros(B, dtype=bool)
+    keys = jax.random.split(key, max_new)
+    arangeB = jnp.arange(B)
+    plen = prompt_mask.sum(axis=1).astype(jnp.int32)  # real prompt length per row
+
+    pre = jax.jit(lambda pr, i, m: prefill(pr, i, m, cfg, cache_len=Lmax, lora=lora, lora_scale=lora_scale))
+    dec = jax.jit(
+        lambda pr, c, t, cu, po, km: _decode_step(pr, c, t, cu, po, km, cfg, lora, lora_scale),
+        donate_argnums=(1,),  # reuse the cache buffers in place
+    )
+
+    h_last, cache = pre(params, prompt_ids, prompt_mask)
+    logits = (h_last @ _lm_head(params, cfg)).astype(jnp.float32)  # predicts the token at column L
+
+    for s in range(max_new):
+        cur = L + s
+        raw = logits
+        if temperature > 0:
+            scaled = raw / temperature
+            nxt = jax.random.categorical(keys[s], scaled, axis=-1)
+        else:
+            scaled = raw
+            nxt = jnp.argmax(raw, axis=-1)
+        lp = jax.nn.log_softmax(scaled, axis=-1)[arangeB, nxt]
+        active = ~finished
+        nxt = jnp.where(finished, pad_id, nxt)
+        ids = ids.at[:, cur].set(nxt)
+        mask = mask.at[:, cur].set(active.astype(mask.dtype))
+        gen_logp = gen_logp.at[:, cur].set(lp * active)
+        finished = finished | (nxt == eos_id)
+        if bool(jnp.all(finished)) or s == max_new - 1:
+            break
+        # feed the just-placed token through one incremental step -> logits for cur+1
+        logits, cache = dec(params, cache, nxt, jnp.int32(cur), plen + s, mask)
+
+    resp_mask = mask.at[:, :L].set(0)
+    return ids, mask, resp_mask, gen_logp
+
+
+def generate_nocache(params, prompt_ids, prompt_mask, cfg: Config, *, max_new, key, eos_id, pad_id, temperature=1.0, lora=None, lora_scale=1.0):
+    """Reference implementation without a KV cache (recomputes the prefix each step).
+    Kept for the cached-vs-uncached equivalence test; use `generate` for real runs.
     """
     B, L = prompt_ids.shape
     Lmax = L + max_new

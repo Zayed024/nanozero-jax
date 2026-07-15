@@ -6,7 +6,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from nanozero import Config, forward, generate, grpo_loss, group_advantages, init_lora, sequence_logprobs
+from nanozero import Config, forward, generate, generate_nocache, grpo_loss, group_advantages, init_lora, sequence_logprobs
 
 # tiny config that still exercises every code path: GQA (4 q / 2 kv), even head_dim for rope
 cfg = Config(
@@ -84,6 +84,17 @@ ga = generate(params, prompt, pmask, cfg, max_new=4, key=jax.random.PRNGKey(0), 
 gb = generate(params, prompt, pmask, cfg, max_new=4, key=jax.random.PRNGKey(7), eos_id=EOS, pad_id=PAD, temperature=0.0)[0]
 assert jnp.array_equal(ga, gb), "greedy decode not deterministic"
 print("greedy deterministic across seeds: OK")
+
+# KV-cached generate must EXACTLY match the no-cache reference (ids + logprobs),
+# greedy AND sampled (same key), on this left-padded batch.
+for temp in (0.0, 1.0):
+    c_ids, c_m, c_rm, c_lp = generate(params, prompt, pmask, cfg, max_new=NEW, key=jax.random.PRNGKey(3), eos_id=EOS, pad_id=PAD, temperature=temp)
+    n_ids, n_m, n_rm, n_lp = generate_nocache(params, prompt, pmask, cfg, max_new=NEW, key=jax.random.PRNGKey(3), eos_id=EOS, pad_id=PAD, temperature=temp)
+    assert jnp.array_equal(c_ids, n_ids), f"cached ids != nocache ids (temp={temp})"
+    assert jnp.array_equal(c_m, n_m) and jnp.array_equal(c_rm, n_rm), f"masks differ (temp={temp})"
+    lp_diff = float(jnp.max(jnp.abs(c_lp - n_lp)))
+    assert lp_diff < 1e-4, f"cached logprobs differ from nocache by {lp_diff:.2e} (temp={temp})"
+print("KV-cache == no-cache (ids exact, logprobs match): OK")
 
 # ---- Day 4: LoRA + GRPO ------------------------------------------------------------------
 # zero-init LoRA (B=0) must leave logits identical -> policy == reference at step 0

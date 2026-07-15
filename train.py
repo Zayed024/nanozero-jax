@@ -12,6 +12,8 @@ Usage (Colab, one 16 GB GPU):
 
 from __future__ import annotations
 
+import time
+
 import optax
 
 import nanozero as nz
@@ -124,6 +126,7 @@ def train(*, steps=100, n_prompts=8, group_size=8, max_new=256, rank=16, lr=1e-4
     print(f"[eval] baseline (LoRA-off) pass@1 = {base_acc:.2%}")
 
     for step in range(steps):
+        t0 = time.time()
         key, pk, gk = jax.random.split(key, 3)
         idx = jax.random.randint(pk, (n_prompts,), 0, len(pool))
         chosen = [pool[int(i)] for i in idx]
@@ -133,14 +136,26 @@ def train(*, steps=100, n_prompts=8, group_size=8, max_new=256, rank=16, lr=1e-4
         full_ids, full_mask, resp_mask, old_lp = nz.generate(
             params, prompt_ids, prompt_mask, cfg, max_new=max_new, key=gk, eos_id=eos_id, pad_id=pad_id, temperature=temperature, lora=lora
         )
+        t_gen = time.time() - t0
 
         L = prompt_ids.shape[1]
         completions = _decode(tok, full_ids[:, L:])
         rewards = jnp.asarray([reward(c, r["numbers"], r["target"]) for c, r in zip(completions, rep)], jnp.float32)
 
+        # All groups degenerate (identical reward within every group) -> every advantage
+        # is 0 -> the update is a guaranteed no-op. Skip the expensive backward.
+        adv = nz.group_advantages(rewards, group_size)
+        if not bool(jnp.any(jnp.abs(adv) > 1e-8)):
+            print(f"step {step:3d} | SKIP (all groups degenerate) | reward {float(rewards.mean()):.3f} | gen {t_gen:.0f}s")
+            continue
+
         batch = (full_ids, full_mask, resp_mask, old_lp, rewards)
         lora, opt_state, m = grpo_update(params, lora, opt_state, optimizer, batch, cfg, group_size=group_size, kl_beta=kl_beta)
-        print(f"step {step:3d} | loss {m['loss']:+.4f} | reward {m['reward_mean']:.3f} | solved {m['reward_solved']:.2%} | adv_std {m['adv_std']:.3f}")
+        t_all = time.time() - t0
+        print(
+            f"step {step:3d} | loss {m['loss']:+.4f} | reward {m['reward_mean']:.3f} | solved {m['reward_solved']:.2%} "
+            f"| adv_std {m['adv_std']:.3f} | gen {t_gen:.0f}s upd {t_all - t_gen:.0f}s"
+        )
 
     final_acc = evaluate_countdown(params, cfg, tok, held_out, pad_id=pad_id, eos_id=eos_id, max_new=max_new, lora=lora)
     print(f"[eval] baseline {base_acc:.2%} -> trained (LoRA-on) {final_acc:.2%}  (Δ {final_acc - base_acc:+.2%})")
