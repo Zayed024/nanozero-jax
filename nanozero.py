@@ -268,6 +268,9 @@ def sequence_logprobs(params, ids, cfg: Config, attn_mask, lora=None, lora_scale
     h = backbone(params, ids, cfg, attn_mask, _positions(attn_mask), lora, lora_scale, remat=remat)  # [B, T, H]
     head = _lm_head(params, cfg)
     B, T, _ = h.shape
+    # Cap B*chunk so one chunk's logits stay ~0.6 GB at vocab 152k: the chunk tensor is
+    # B*chunk*vocab fp32, and at B=64/chunk=64 that's 2.5 GB — the exact OOM on a T4.
+    chunk = max(1, min(chunk, 1024 // max(B, 1)))
     h_shift = h[:, :-1]  # [B, T-1, H]: hidden at p predicts the token at p+1
     tok = ids[:, 1:]  # [B, T-1]
 
