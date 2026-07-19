@@ -105,7 +105,14 @@ def _encode_prompts(tok, user_prompts, pad_id):
     return jnp.asarray(ids, jnp.int32), jnp.asarray(mask, jnp.int32)
 
 
-def train(*, steps=100, n_prompts=8, group_size=8, max_new=256, rank=16, lr=1e-4, kl_beta=0.001, temperature=1.0, seed=0, pool_size=2000, eval_n=32):
+def train(*, steps=100, n_prompts=8, group_size=8, max_new=256, rank=16, lr=1e-4, kl_beta=0.001, temperature=1.0, seed=0, pool_size=2000, eval_n=32, ckpt_every=10, ckpt_path="nanozero_ckpt"):
+    """`ckpt_path` gets `.npz` (adapter) + `.json` (step) every `ckpt_every` steps; if
+    they already exist, training RESUMES from them (Adam moments are not restored —
+    acceptable at this scale). On Colab, point ckpt_path at Google Drive so checkpoints
+    survive a runtime disconnect."""
+    import json as _json
+    import os
+
     import jax
     import jax.numpy as jnp
     from transformers import AutoTokenizer
@@ -114,7 +121,13 @@ def train(*, steps=100, n_prompts=8, group_size=8, max_new=256, rank=16, lr=1e-4
     tok = AutoTokenizer.from_pretrained(path)
     eos_id, pad_id = tok.eos_token_id, (tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id)
 
-    lora = nz.init_lora(params, cfg, rank=rank, seed=seed)
+    start_step = 0
+    if os.path.exists(ckpt_path + ".npz"):
+        lora = nz.load_lora(ckpt_path + ".npz")
+        start_step = _json.load(open(ckpt_path + ".json"))["step"] + 1 if os.path.exists(ckpt_path + ".json") else 0
+        print(f"[ckpt] resumed adapter from {ckpt_path}.npz at step {start_step}")
+    else:
+        lora = nz.init_lora(params, cfg, rank=rank, seed=seed)
     optimizer = optax.chain(optax.clip_by_global_norm(1.0), optax.adamw(lr))
     opt_state = optimizer.init(lora)
 
@@ -122,10 +135,13 @@ def train(*, steps=100, n_prompts=8, group_size=8, max_new=256, rank=16, lr=1e-4
     held_out = load_countdown(pool_size + eval_n, split="train")[-eval_n:]  # held out AFTER the training pool
     key = jax.random.PRNGKey(seed)
 
-    base_acc = evaluate_countdown(params, cfg, tok, held_out, pad_id=pad_id, eos_id=eos_id, max_new=max_new, lora=None)
-    print(f"[eval] baseline (LoRA-off) pass@1 = {base_acc:.2%}")
+    if start_step == 0:  # skip the (slow) baseline eval when resuming
+        base_acc = evaluate_countdown(params, cfg, tok, held_out, pad_id=pad_id, eos_id=eos_id, max_new=max_new, lora=None)
+        print(f"[eval] baseline (LoRA-off) pass@1 = {base_acc:.2%}")
+    else:
+        base_acc = float("nan")
 
-    for step in range(steps):
+    for step in range(start_step, steps):
         t0 = time.time()
         key, pk, gk = jax.random.split(key, 3)
         idx = jax.random.randint(pk, (n_prompts,), 0, len(pool))
@@ -156,6 +172,9 @@ def train(*, steps=100, n_prompts=8, group_size=8, max_new=256, rank=16, lr=1e-4
             f"step {step:3d} | loss {m['loss']:+.4f} | reward {m['reward_mean']:.3f} | solved {m['reward_solved']:.2%} "
             f"| adv_std {m['adv_std']:.3f} | gen {t_gen:.0f}s upd {t_all - t_gen:.0f}s"
         )
+        if step % ckpt_every == 0 or step == steps - 1:
+            nz.save_lora(lora, ckpt_path + ".npz")
+            _json.dump({"step": step}, open(ckpt_path + ".json", "w"))
 
     final_acc = evaluate_countdown(params, cfg, tok, held_out, pad_id=pad_id, eos_id=eos_id, max_new=max_new, lora=lora)
     print(f"[eval] baseline {base_acc:.2%} -> trained (LoRA-on) {final_acc:.2%}  (Δ {final_acc - base_acc:+.2%})")

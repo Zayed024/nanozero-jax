@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import dataclass
+from functools import partial
 from glob import glob
 
 import jax
@@ -362,6 +363,23 @@ def _decode_step(params, cache, tok, cur, pos_row, key_mask, cfg: Config, lora, 
     return x @ _lm_head(params, cfg), new_cache
 
 
+# Module-level jits, compiled ONCE per shape for the whole training run. Defining jits
+# inside `generate` (the previous version) is an anti-pattern: each call builds a fresh
+# closure with `lora` baked in as a compile-time CONSTANT -> recompile every step AND
+# every step's executable pins its LoRA copy in device memory (slow creep -> OOM).
+# Here cfg/cache_len/lora_scale are static; params/lora are traced arguments.
+_prefill_jit = partial(jax.jit, static_argnames=("cfg", "cache_len", "lora_scale"))(
+    lambda params, ids, mask, lora, *, cfg, cache_len, lora_scale: prefill(
+        params, ids, mask, cfg, cache_len=cache_len, lora=lora, lora_scale=lora_scale
+    )
+)
+_decode_jit = partial(jax.jit, static_argnames=("cfg", "lora_scale"), donate_argnums=(1,))(
+    lambda params, cache, tok, cur, pos_row, key_mask, lora, *, cfg, lora_scale: _decode_step(
+        params, cache, tok, cur, pos_row, key_mask, cfg, lora, lora_scale
+    )
+)
+
+
 def generate(params, prompt_ids, prompt_mask, cfg: Config, *, max_new, key, eos_id, pad_id, temperature=1.0, lora=None, lora_scale=1.0):
     """KV-cached batched sampling for left-padded prompts: prefill once, then O(1)
     work per generated token. Returns (all [B, L+max_new]):
@@ -380,13 +398,7 @@ def generate(params, prompt_ids, prompt_mask, cfg: Config, *, max_new, key, eos_
     arangeB = jnp.arange(B)
     plen = prompt_mask.sum(axis=1).astype(jnp.int32)  # real prompt length per row
 
-    pre = jax.jit(lambda pr, i, m: prefill(pr, i, m, cfg, cache_len=Lmax, lora=lora, lora_scale=lora_scale))
-    dec = jax.jit(
-        lambda pr, c, t, cu, po, km: _decode_step(pr, c, t, cu, po, km, cfg, lora, lora_scale),
-        donate_argnums=(1,),  # reuse the cache buffers in place
-    )
-
-    h_last, cache = pre(params, prompt_ids, prompt_mask)
+    h_last, cache = _prefill_jit(params, prompt_ids, prompt_mask, lora, cfg=cfg, cache_len=Lmax, lora_scale=lora_scale)
     logits = (h_last @ _lm_head(params, cfg)).astype(jnp.float32)  # predicts the token at column L
 
     for s in range(max_new):
@@ -408,7 +420,7 @@ def generate(params, prompt_ids, prompt_mask, cfg: Config, *, max_new, key, eos_
         if bool(jnp.all(finished)) or s == max_new - 1:
             break
         # feed the just-placed token through one incremental step -> logits for cur+1
-        logits, cache = dec(params, cache, nxt, jnp.int32(cur), plen + s, mask)
+        logits, cache = _decode_jit(params, cache, nxt, jnp.int32(cur), plen + s, mask, lora, cfg=cfg, lora_scale=lora_scale)
 
     resp_mask = mask.at[:, :L].set(0)
     return ids, mask, resp_mask, gen_logp
