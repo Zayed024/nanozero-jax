@@ -17,7 +17,33 @@ The contribution is the *reproduction path*, not beating a baseline: a single-fi
 - [x] **Day 5** — rollout/train loop (`train.py`; CPU test: rollout → grpo_update → LoRA moves, base frozen)
 - [x] **Day 6** — eval: greedy pass@1, LoRA-off (baseline) vs LoRA-on (trained) — before/after wired into `train.py`
 
-**Status: full pipeline built and CPU-verified (18 tests + structural smoke green).** The remaining step is the real training run on Colab (Qwen2.5-0.5B, T4) to produce the headline before/after numbers + the HF model.
+## Results
+
+**Qwen2.5-0.5B-Instruct · LoRA (rank 16, attention projections) · GRPO · one Colab T4:**
+
+| | pass@1 (128 held-out Countdown problems, greedy) |
+|---|---|
+| baseline (LoRA off) | **0.00%** |
+| after 200 GRPO steps (LoRA on) | **15.62%** (+15.62) |
+
+Training dynamics matched the TinyZero recipe: the model first learns the *format*
+(mean reward climbs 0.01 → 0.10 as `<answer>` tags appear), then begins actually
+solving (`solved%` climbs from 0). Reward is rLLM's exact `compute_score`
+(1.0 correct / 0.1 valid-format / 0.0 no answer). ~40 s/step at batch 64
+(8 prompts × group 8, 256 new tokens) after the KV-cache + remat work below.
+
+**What it took to fit one 16 GB card** (the reproduction path — this is the contribution):
+- **LoRA-off reference**: π_ref = the same frozen base with adapters disabled — one
+  copy of weights serves both policy and reference; zero-init B ⇒ KL starts at exactly 0.
+- **Never materialize `[B, T, vocab]` logits** (at vocab 152k that single tensor is
+  ~12 GB): decode computes logits only at the current position; scoring applies the LM
+  head in checkpointed chunks with `B·chunk ≤ 1024`.
+- **Per-layer gradient checkpointing** on the differentiated pass (otherwise 24 layers
+  of attention residuals ≈ 16 GB).
+- **KV-cache decoding**, bit-exact vs the no-cache reference (tested), ~20× faster steps.
+- **Module-level jits** (a jit closure rebuilt per call recompiles every step and pins
+  stale LoRA copies — the leak that OOM'd multi-hour runs).
+- Degenerate GRPO groups (identical rewards ⇒ zero advantage) skip the backward.
 
 ## Train (Colab, one 16 GB GPU)
 
